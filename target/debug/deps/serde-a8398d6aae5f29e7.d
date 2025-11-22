@@ -1,0 +1,14 @@
+/home/kali/Downloads/Rust-Project/distributed-log-aggregator/target/debug/deps/serde-a8398d6aae5f29e7.d: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/kali/Downloads/Rust-Project/distributed-log-aggregator/target/debug/build/serde-5e55967fd4a49097/out/private.rs
+
+/home/kali/Downloads/Rust-Project/distributed-log-aggregator/target/debug/deps/libserde-a8398d6aae5f29e7.rlib: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/kali/Downloads/Rust-Project/distributed-log-aggregator/target/debug/build/serde-5e55967fd4a49097/out/private.rs
+
+/home/kali/Downloads/Rust-Project/distributed-log-aggregator/target/debug/deps/libserde-a8398d6aae5f29e7.rmeta: /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /home/kali/Downloads/Rust-Project/distributed-log-aggregator/target/debug/build/serde-5e55967fd4a49097/out/private.rs
+
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/home/kali/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/home/kali/Downloads/Rust-Project/distributed-log-aggregator/target/debug/build/serde-5e55967fd4a49097/out/private.rs:
+
+# env-dep:OUT_DIR=/home/kali/Downloads/Rust-Project/distributed-log-aggregator/target/debug/build/serde-5e55967fd4a49097/out
