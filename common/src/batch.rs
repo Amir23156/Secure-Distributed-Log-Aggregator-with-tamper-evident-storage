@@ -1,8 +1,9 @@
 use rand::Rng;
-use sha2::{Sha256, Digest};
-use ed25519_dalek::{Signature, VerifyingKey, SigningKey};
-use ed25519_dalek::Signer;
 use rand::rngs::OsRng;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::Signer;
 
 /// A tamper-evident batch of logs sent from an agent to the server.
 ///
@@ -12,6 +13,7 @@ use rand::rngs::OsRng;
 /// - `timestamp`: unix time when batch was created
 /// - `signature`: digital signature of the batch content
 /// - `public_key`: the agent's public key (used to verify signature)
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LogBatch {
     pub prev_hash: [u8; 32],
     pub logs: Vec<String>,
@@ -56,4 +58,3 @@ pub fn generate_keypair() -> SigningKey {
     OsRng.fill(&mut bytes);
     SigningKey::from_bytes(&bytes)
 }
-

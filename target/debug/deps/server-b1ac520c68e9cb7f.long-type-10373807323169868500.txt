@@ -1,0 +1,2 @@
+fn((State<AppState>, Json<LogBatch>)) -> impl Future<Output = impl IntoResponse> {submit_batch}
+fn((State<AppState>, Json<LogBatch>)) -> impl Future<Output = impl IntoResponse> {submit_batch}: Handler<_, _>
