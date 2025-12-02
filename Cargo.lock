@@ -1779,6 +1779,7 @@ dependencies = [
  "axum",
  "bincode",
  "common",
+ "ed25519-dalek",
  "serde",
  "serde_json",
  "sqlx",

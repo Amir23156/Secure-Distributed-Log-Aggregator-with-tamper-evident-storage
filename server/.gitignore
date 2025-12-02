@@ -1,1 +1,4 @@
 /target
+logchain.db
+mylog.txt
+*.db
