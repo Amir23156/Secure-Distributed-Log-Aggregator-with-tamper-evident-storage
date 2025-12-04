@@ -59,5 +59,5 @@ fn verify_chain(chain: &Vec<(i64, LogBatch)>) {
         prev_hash = batch.compute_hash();
     }
 
-    println!("✔️ Chain valid. No tampering detected.");
+    println!("Chain valid. No tampering detected.");
 }
