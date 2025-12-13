@@ -103,6 +103,7 @@ async fn main() {
 
     ensure_column(&pool, "batches", "received_at", "INTEGER NOT NULL DEFAULT 0").await;
     ensure_column(&pool, "batches", "source", "TEXT").await;
+    ensure_append_only_triggers(&pool).await;
 
     sqlx::query(
         r#"
@@ -657,6 +658,70 @@ async fn ensure_column(pool: &SqlitePool, table: &str, column: &str, definition:
         "ALTER TABLE {table} ADD COLUMN {column} {definition}"
     );
     let _ = sqlx::query(&alter).execute(pool).await;
+}
+
+async fn ensure_append_only_triggers(pool: &SqlitePool) {
+    // Block updates/deletes to enforce append-only.
+    let _ = sqlx::query("DROP TRIGGER IF EXISTS batches_no_update").execute(pool).await;
+    let _ = sqlx::query("DROP TRIGGER IF EXISTS batches_no_delete").execute(pool).await;
+    let _ = sqlx::query("DROP TRIGGER IF EXISTS batches_enforce_seq").execute(pool).await;
+
+    sqlx::query(
+        r#"
+        CREATE TRIGGER batches_no_update
+        BEFORE UPDATE ON batches
+        BEGIN
+            SELECT RAISE(ABORT, 'append-only: updates forbidden');
+        END;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    sqlx::query(
+        r#"
+        CREATE TRIGGER batches_no_delete
+        BEFORE DELETE ON batches
+        BEGIN
+            SELECT RAISE(ABORT, 'append-only: deletes forbidden');
+        END;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .ok();
+
+    // Enforce monotonic seq and hash linkage per agent even if someone bypasses the API.
+    sqlx::query(
+        r#"
+        CREATE TRIGGER batches_enforce_seq
+        BEFORE INSERT ON batches
+        BEGIN
+            -- Detect last state for this agent.
+            SELECT
+                CASE
+                    WHEN (SELECT COUNT(*) FROM batches WHERE agent_id = NEW.agent_id) = 0 THEN
+                        CASE
+                            WHEN NEW.seq != 1 THEN
+                                RAISE(ABORT, 'append-only: first seq must be 1')
+                            WHEN NEW.prev_hash != zeroblob(32) THEN
+                                RAISE(ABORT, 'append-only: first prev_hash must be zero')
+                        END
+                    ELSE
+                        CASE
+                            WHEN NEW.seq != (SELECT seq + 1 FROM batches WHERE agent_id = NEW.agent_id ORDER BY seq DESC LIMIT 1) THEN
+                                RAISE(ABORT, 'append-only: non-contiguous seq')
+                            WHEN NEW.prev_hash != (SELECT hash FROM batches WHERE agent_id = NEW.agent_id ORDER BY seq DESC LIMIT 1) THEN
+                                RAISE(ABORT, 'append-only: prev_hash mismatch')
+                        END
+                END;
+        END;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .ok();
 }
 
 fn now_unix() -> i64 {
