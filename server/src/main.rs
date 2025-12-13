@@ -51,6 +51,14 @@ struct ExportParams {
     limit: Option<u64>,
 }
 
+#[derive(Serialize)]
+struct AgentCheckpoint {
+    agent_id: String,
+    last_seq: u64,
+    last_hash: [u8; 32],
+    count: u64,
+}
+
 #[derive(Debug, Deserialize)]
 struct RegisterRequest {
     agent_id: String,
@@ -194,6 +202,7 @@ async fn main() {
         .route("/agents/register", post(handler_register_agent))
         .route("/agents/rotate", post(handler_rotate_agent))
         .route("/batches", get(handler_get_all))
+        .route("/batches/checkpoints", get(handler_checkpoints))
         .route("/batches/export", get(handler_export))
         .route("/batches/:id", get(handler_get_one))
         .with_state(state);
@@ -632,6 +641,45 @@ async fn handler_export(
     }
 
     Ok(Json(results))
+}
+
+/* ----------------------- CHECKPOINTS /batches/checkpoints ----------------------- */
+
+async fn handler_checkpoints(State(state): State<AppState>) -> Result<Json<Vec<AgentCheckpoint>>, StatusCode> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            agent_id,
+            MAX(seq) AS last_seq,
+            COUNT(*) AS count,
+            (SELECT hash FROM batches b2 WHERE b2.agent_id = b.agent_id ORDER BY seq DESC LIMIT 1) AS last_hash
+        FROM batches b
+        GROUP BY agent_id
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut checkpoints = Vec::new();
+    for row in rows {
+        let agent_id: String = row.get("agent_id");
+        let last_seq: i64 = row.get("last_seq");
+        let count: i64 = row.get("count");
+        let last_hash_vec: Vec<u8> = row.get("last_hash");
+        let last_hash: [u8; 32] = last_hash_vec
+            .try_into()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+        checkpoints.push(AgentCheckpoint {
+            agent_id,
+            last_seq: last_seq as u64,
+            last_hash,
+            count: count as u64,
+        });
+    }
+
+    Ok(Json(checkpoints))
 }
 
 /* ----------------------- GET /batches/:id ----------------------- */
