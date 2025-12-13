@@ -4,10 +4,11 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{sleep, Duration};
 use chrono::Utc;
 use ed25519_dalek::Signature;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use serde::Deserialize;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,6 +26,38 @@ async fn main() -> Result<()> {
 
     let mut key = load_or_generate_key(&config)?;
     let mut seq = load_seq(&config)?; // persistent monotonic counter
+    let mut prev_hash = load_prev_hash(&config)?;
+
+    // Try to align with server checkpoint so we don't send out-of-sync batches.
+    match fetch_checkpoint(&config, &config.agent_id).await {
+        Ok(Some(cp)) => {
+            prev_hash = cp.last_hash;
+            seq = cp.last_seq.saturating_add(1);
+            persist_seq(&config, seq)?;
+            persist_prev_hash(&config, prev_hash)?;
+            println!(
+                "Synced from server checkpoint: last_seq={}, next_seq={}, prev_hash={}",
+                cp.last_seq,
+                seq,
+                to_hex(&prev_hash)
+            );
+        }
+        Ok(None) => {
+            // No batches stored for this agent; reset local state to the beginning.
+            if seq != 1 || prev_hash != [0u8; 32] {
+                println!("Server has no batches for this agent; resetting local chain state");
+                seq = 1;
+                prev_hash = [0u8; 32];
+                persist_seq(&config, seq)?;
+                persist_prev_hash(&config, prev_hash)?;
+            }
+        }
+        Err(err) => {
+            eprintln!(
+                "Could not fetch checkpoints from server; using local state: {err}"
+            );
+        }
+    }
 
     // Open log file
     let file = File::open(&config.log_path).await?;
@@ -32,7 +65,6 @@ async fn main() -> Result<()> {
     let mut lines = reader.lines();
 
     let mut buffer: Vec<String> = Vec::new();
-    let mut prev_hash = [0u8; 32];
 
     while let Some(line) = lines.next_line().await? {
         buffer.push(line);
@@ -65,6 +97,7 @@ async fn main() -> Result<()> {
                     prev_hash = next_hash;
                     seq += 1;
                     persist_seq(&config, seq)?;
+                    persist_prev_hash(&config, prev_hash)?;
                 }
                 Err(err) => {
                     eprintln!("Failed to send batch: {err:?}");
@@ -242,6 +275,10 @@ impl AgentConfig {
     fn seq_path(&self) -> PathBuf {
         self.state_dir.join("seq.txt")
     }
+
+    fn prev_hash_path(&self) -> PathBuf {
+        self.state_dir.join("prev_hash.txt")
+    }
 }
 
 fn derive_agent_id(key_path: &Path) -> Result<String> {
@@ -283,10 +320,59 @@ fn persist_seq(config: &AgentConfig, seq: u64) -> Result<()> {
     Ok(())
 }
 
+fn load_prev_hash(config: &AgentConfig) -> Result<[u8; 32]> {
+    let path = config.prev_hash_path();
+    if let Ok(contents) = fs::read_to_string(&path) {
+        let hex = contents.trim();
+        if hex.len() == 64 {
+            let mut out = [0u8; 32];
+            for i in 0..32 {
+                let byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                    .map_err(|e| anyhow!("invalid prev_hash hex: {e}"))?;
+                out[i] = byte;
+            }
+            return Ok(out);
+        }
+    }
+    Ok([0u8; 32])
+}
+
+fn persist_prev_hash(config: &AgentConfig, hash: [u8; 32]) -> Result<()> {
+    fs::write(config.prev_hash_path(), to_hex(&hash))?;
+    Ok(())
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+#[derive(Deserialize)]
+struct AgentCheckpoint {
+    agent_id: String,
+    last_seq: u64,
+    last_hash: [u8; 32],
+    #[serde(rename = "count")]
+    _count: u64,
+}
+
+async fn fetch_checkpoint(config: &AgentConfig, agent_id: &str) -> Result<Option<AgentCheckpoint>> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/batches/checkpoints", config.server_url))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "checkpoint request failed with status {}",
+            resp.status()
+        ));
+    }
+
+    let checkpoints: Vec<AgentCheckpoint> = resp.json().await?;
+    Ok(checkpoints.into_iter().find(|cp| cp.agent_id == agent_id))
 }
