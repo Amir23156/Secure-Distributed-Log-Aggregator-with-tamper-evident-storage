@@ -1,6 +1,6 @@
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -13,13 +13,19 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::env;
+use std::collections::HashMap;
+use std::time::{Duration as StdDuration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{self, Duration};
+use tokio::sync::Mutex;
+use std::sync::Arc;
 
 #[derive(Clone)]
 struct AppState {
     pool: SqlitePool,
     require_registration: bool,
+    rate_limiter: Arc<RateLimiter>,
+    auth_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -64,6 +70,18 @@ fn log_submit_error(agent: &str, reason: &str) {
     eprintln!("submit rejected for agent {}: {}", agent, reason);
 }
 
+fn valid_auth(headers: &HeaderMap, expected: &str) -> bool {
+    if let Some(hv) = headers.get("authorization") {
+        if let Ok(v) = hv.to_str() {
+            let pref = "Bearer ";
+            if let Some(rest) = v.strip_prefix(pref) {
+                return rest == expected;
+            }
+        }
+    }
+    false
+}
+
 #[derive(Debug, Deserialize)]
 struct RegisterRequest {
     agent_id: String,
@@ -88,6 +106,22 @@ async fn main() {
     let require_registration = std::env::var("REQUIRE_AGENT_REGISTRATION")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+
+    let max_req_per_window = env::var("RATE_LIMIT_MAX")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(200);
+    let window_secs = env::var("RATE_LIMIT_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60);
+
+    let rate_limiter = Arc::new(RateLimiter::new(
+        max_req_per_window,
+        StdDuration::from_secs(window_secs),
+    ));
+
+    let auth_token = env::var("SUBMIT_BEARER_TOKEN").ok();
 
     let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://logchain.db".to_string());
     let pool = SqlitePool::connect(&db_url)
@@ -201,6 +235,8 @@ async fn main() {
     let state = AppState {
         pool,
         require_registration,
+        rate_limiter,
+        auth_token,
     };
 
     let app = Router::new()
@@ -230,8 +266,31 @@ async fn main() {
 async fn handler_submit_batch(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(batch): Json<LogBatch>,
 ) -> impl IntoResponse {
+    if !state.rate_limiter.allow(&addr.to_string()).await {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(SubmitResponse {
+                status: "error".into(),
+                message: "rate limit exceeded".into(),
+            }),
+        );
+    }
+
+    if let Some(expected) = &state.auth_token {
+        if !valid_auth(&headers, expected) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(SubmitResponse {
+                    status: "error".into(),
+                    message: "missing or invalid auth".into(),
+                }),
+            );
+        }
+    }
+
     if !batch.verify() {
         log_submit_error(&batch.agent_id, "invalid signature");
         return (
@@ -1020,4 +1079,37 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+struct RateLimiter {
+    max: u32,
+    window: StdDuration,
+    buckets: Mutex<HashMap<String, (Instant, u32)>>,
+}
+
+impl RateLimiter {
+    fn new(max: u32, window: StdDuration) -> Self {
+        Self {
+            max,
+            window,
+            buckets: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn allow(&self, key: &str) -> bool {
+        let mut guard = self.buckets.lock().await;
+        let now = Instant::now();
+        let entry = guard.entry(key.to_string()).or_insert((now, 0));
+
+        if now.duration_since(entry.0) > self.window {
+            *entry = (now, 0);
+        }
+
+        if entry.1 >= self.max {
+            return false;
+        }
+
+        entry.1 += 1;
+        true
+    }
 }

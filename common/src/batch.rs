@@ -58,6 +58,49 @@ impl LogBatch {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_and_verify_round_trip() {
+        let mut batch = LogBatch {
+            prev_hash: [1u8; 32],
+            logs: vec!["line1".into(), "line2".into()],
+            timestamp: 1234,
+            agent_id: "agent-a".into(),
+            seq: 1,
+            signature: Signature::from_bytes(&[0u8; 64]),
+            public_key: generate_keypair().verifying_key(),
+        };
+
+        let signer = generate_keypair();
+        batch.sign(&signer);
+        assert!(batch.verify(), "signature must verify");
+    }
+
+    #[test]
+    fn tamper_changes_hash_and_breaks_signature() {
+        let mut batch = LogBatch {
+            prev_hash: [2u8; 32],
+            logs: vec!["a".into()],
+            timestamp: 1,
+            agent_id: "agent-b".into(),
+            seq: 1,
+            signature: Signature::from_bytes(&[0u8; 64]),
+            public_key: generate_keypair().verifying_key(),
+        };
+
+        let signer = generate_keypair();
+        batch.sign(&signer);
+        assert!(batch.verify());
+
+        // Tamper
+        batch.logs.push("evil".into());
+        assert!(!batch.verify(), "tampering should fail verification");
+    }
+}
+
 /// Utility: create a new signing key (agent identity).
 pub fn generate_keypair() -> SigningKey {
     let mut bytes = [0u8; 32];
