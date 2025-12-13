@@ -10,10 +10,12 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, SqlitePool};
 use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
 struct AppState {
     pool: SqlitePool,
+    require_registration: bool,
 }
 
 #[derive(Serialize)]
@@ -36,15 +38,32 @@ struct ListParams {
     limit: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RegisterRequest {
+    agent_id: String,
+    public_key_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RotateRequest {
+    agent_id: String,
+    new_public_key_hex: String,
+    auth_signature_hex: String,
+}
+
+#[derive(Serialize)]
+struct AgentResponse {
+    status: String,
+    message: String,
+}
+
 #[tokio::main]
 async fn main() {
-    let pool = SqlitePool::connect("sqlite://logchain.db")
-        .await
-        .unwrap();
+    let require_registration = std::env::var("REQUIRE_AGENT_REGISTRATION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
-    // Drop + recreate to ensure schema upgrades for new columns.
-    sqlx::query("DROP TABLE IF EXISTS batches")
-        .execute(&pool)
+    let pool = SqlitePool::connect("sqlite://logchain.db")
         .await
         .unwrap();
 
@@ -69,6 +88,19 @@ async fn main() {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS agents (
+            agent_id TEXT PRIMARY KEY,
+            public_key BLOB NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
         CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_seq
         ON batches (agent_id, seq);
         "#,
@@ -77,10 +109,15 @@ async fn main() {
     .await
     .unwrap();
 
-    let state = AppState { pool };
+    let state = AppState {
+        pool,
+        require_registration,
+    };
 
     let app = Router::new()
         .route("/submit", post(handler_submit_batch))
+        .route("/agents/register", post(handler_register_agent))
+        .route("/agents/rotate", post(handler_rotate_agent))
         .route("/batches", get(handler_get_all))
         .route("/batches/:id", get(handler_get_one))
         .with_state(state);
@@ -111,6 +148,17 @@ async fn handler_submit_batch(
 
     let computed_hash = batch.compute_hash();
     let logs_json = serde_json::to_string(&batch.logs).unwrap();
+
+    // Ensure agent key is trusted/registered before accepting.
+    if let Err(msg) = ensure_agent_key(&state, &batch).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(SubmitResponse {
+                status: "error".into(),
+                message: msg,
+            }),
+        );
+    }
 
     // Validate hash chain + ordering for this agent.
     if let Err(msg) = validate_chain(&state.pool, &batch, &computed_hash).await {
@@ -146,6 +194,170 @@ async fn handler_submit_batch(
         Json(SubmitResponse {
             status: "ok".into(),
             message: "batch stored".into(),
+        }),
+    )
+}
+
+/* ----------------------- REGISTER / ROTATE AGENT KEYS ----------------------- */
+
+async fn handler_register_agent(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterRequest>,
+) -> impl IntoResponse {
+    let pk = match parse_hex_public_key(&req.public_key_hex) {
+        Ok(pk) => pk,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AgentResponse {
+                    status: "error".into(),
+                    message: msg,
+                }),
+            )
+        }
+    };
+
+    let existing = sqlx::query("SELECT public_key FROM agents WHERE agent_id = ?1")
+        .bind(&req.agent_id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+
+    if let Some(row) = existing {
+        let stored: Vec<u8> = row.get("public_key");
+        if stored == pk.to_bytes() {
+            return (
+                StatusCode::OK,
+                Json(AgentResponse {
+                    status: "ok".into(),
+                    message: "agent already registered with this key".into(),
+                }),
+            );
+        } else {
+            return (
+                StatusCode::CONFLICT,
+                Json(AgentResponse {
+                    status: "error".into(),
+                    message: "agent ID already registered with a different key".into(),
+                }),
+            );
+        }
+    }
+
+    sqlx::query("INSERT INTO agents (agent_id, public_key, created_at) VALUES (?1, ?2, ?3)")
+        .bind(&req.agent_id)
+        .bind(pk.to_bytes().to_vec())
+        .bind(now_unix())
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    (
+        StatusCode::CREATED,
+        Json(AgentResponse {
+            status: "ok".into(),
+            message: "agent registered".into(),
+        }),
+    )
+}
+
+async fn handler_rotate_agent(
+    State(state): State<AppState>,
+    Json(req): Json<RotateRequest>,
+) -> impl IntoResponse {
+    let Some(row) = sqlx::query("SELECT public_key FROM agents WHERE agent_id = ?1")
+        .bind(&req.agent_id)
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap() else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(AgentResponse {
+                    status: "error".into(),
+                    message: "agent not registered".into(),
+                }),
+            );
+        };
+
+    let stored: Vec<u8> = row.get("public_key");
+    let current_pk = match stored.try_into() {
+        Ok(bytes) => match VerifyingKey::from_bytes(&bytes) {
+            Ok(pk) => pk,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(AgentResponse {
+                        status: "error".into(),
+                        message: "stored public key is invalid".into(),
+                    }),
+                )
+            }
+        },
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AgentResponse {
+                    status: "error".into(),
+                    message: "stored public key is invalid".into(),
+                }),
+            )
+        }
+    };
+
+    let new_pk = match parse_hex_public_key(&req.new_public_key_hex) {
+        Ok(pk) => pk,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AgentResponse {
+                    status: "error".into(),
+                    message: msg,
+                }),
+            )
+        }
+    };
+
+    let sig = match parse_hex_signature(&req.auth_signature_hex) {
+        Ok(sig) => sig,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(AgentResponse {
+                    status: "error".into(),
+                    message: msg,
+                }),
+            )
+        }
+    };
+
+    let rotation_message =
+        format!("rotate:{}:{}", req.agent_id, req.new_public_key_hex).into_bytes();
+
+    if current_pk
+        .verify_strict(&rotation_message, &sig)
+        .is_err()
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(AgentResponse {
+                status: "error".into(),
+                message: "rotation signature invalid".into(),
+            }),
+        );
+    }
+
+    sqlx::query("UPDATE agents SET public_key = ?1 WHERE agent_id = ?2")
+        .bind(new_pk.to_bytes().to_vec())
+        .bind(&req.agent_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    (
+        StatusCode::OK,
+        Json(AgentResponse {
+            status: "ok".into(),
+            message: "agent key rotated".into(),
         }),
     )
 }
@@ -318,4 +530,76 @@ async fn validate_chain(pool: &SqlitePool, batch: &LogBatch, computed_hash: &[u8
     }
 
     Ok(())
+}
+
+async fn ensure_agent_key(state: &AppState, batch: &LogBatch) -> Result<(), String> {
+    let existing = sqlx::query("SELECT public_key FROM agents WHERE agent_id = ?1")
+        .bind(&batch.agent_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(|_| "failed to check agent registry".to_string())?;
+
+    match existing {
+        Some(row) => {
+            let stored: Vec<u8> = row.get("public_key");
+            if stored != batch.public_key.to_bytes() {
+                return Err("public key does not match registered agent key".into());
+            }
+        }
+        None => {
+            if state.require_registration {
+                return Err("agent not registered; register key before sending batches".into());
+            }
+
+            sqlx::query("INSERT INTO agents (agent_id, public_key, created_at) VALUES (?1, ?2, ?3)")
+                .bind(&batch.agent_id)
+                .bind(batch.public_key.to_bytes().to_vec())
+                .bind(now_unix())
+                .execute(&state.pool)
+                .await
+                .map_err(|_| "failed to auto-register agent key".to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_hex_public_key(hex: &str) -> Result<VerifyingKey, String> {
+    let bytes = parse_hex_bytes::<32>(hex)?;
+    VerifyingKey::from_bytes(&bytes).map_err(|_| "invalid public key bytes".into())
+}
+
+fn parse_hex_signature(hex: &str) -> Result<Signature, String> {
+    let bytes = parse_hex_bytes::<64>(hex)?;
+    Ok(Signature::from_bytes(&bytes))
+}
+
+fn parse_hex_bytes<const N: usize>(hex: &str) -> Result<[u8; N], String> {
+    if hex.len() != N * 2 {
+        return Err(format!("expected {} hex chars", N * 2));
+    }
+
+    let mut out = [0u8; N];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let high = hex_val(chunk[0])?;
+        let low = hex_val(chunk[1])?;
+        out[i] = (high << 4) | low;
+    }
+    Ok(out)
+}
+
+fn hex_val(b: u8) -> Result<u8, String> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(10 + (b - b'a')),
+        b'A'..=b'F' => Ok(10 + (b - b'A')),
+        _ => Err("invalid hex".into()),
+    }
+}
+
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
