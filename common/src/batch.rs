@@ -13,11 +13,15 @@ use ed25519_dalek::Signer;
 /// - `timestamp`: unix time when batch was created
 /// - `signature`: digital signature of the batch content
 /// - `public_key`: the agent's public key (used to verify signature)
+/// - `agent_id`: stable identifier for the producing agent
+/// - `seq`: monotonically increasing sequence number per agent
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct LogBatch {
     pub prev_hash: [u8; 32],
     pub logs: Vec<String>,
     pub timestamp: u64,
+    pub agent_id: String,
+    pub seq: u64,
     pub signature: Signature,
     pub public_key: VerifyingKey,
 }
@@ -29,6 +33,8 @@ impl LogBatch {
 
         hasher.update(self.prev_hash);
         hasher.update(self.timestamp.to_le_bytes());
+        hasher.update(self.seq.to_le_bytes());
+        hasher.update(self.agent_id.as_bytes());
 
         for log in &self.logs {
             hasher.update(log.as_bytes());
