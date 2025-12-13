@@ -7,8 +7,10 @@ use axum::{
 };
 use common::batch::LogBatch;
 use ed25519_dalek::{Signature, VerifyingKey};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{self, Duration};
@@ -85,6 +87,7 @@ async fn main() {
             prev_hash BLOB NOT NULL,
             hash BLOB NOT NULL,
             logs TEXT NOT NULL,
+            logs_compressed BLOB,
             timestamp INTEGER NOT NULL,
             signature BLOB NOT NULL,
             public_key BLOB NOT NULL,
@@ -112,12 +115,23 @@ async fn main() {
 
     ensure_column(&pool, "batches", "received_at", "INTEGER NOT NULL DEFAULT 0").await;
     ensure_column(&pool, "batches", "source", "TEXT").await;
+    ensure_column(&pool, "batches", "logs_compressed", "BLOB").await;
     ensure_append_only_triggers(&pool).await;
 
     sqlx::query(
         r#"
         CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_seq
         ON batches (agent_id, seq);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_hash
+        ON batches (agent_id, hash);
         "#,
     )
     .execute(&pool)
@@ -187,6 +201,18 @@ async fn handler_submit_batch(
 
     let computed_hash = batch.compute_hash();
     let logs_json = serde_json::to_string(&batch.logs).unwrap();
+    let logs_compressed = match compress_json(&logs_json) {
+        Ok(data) => data,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SubmitResponse {
+                    status: "error".into(),
+                    message: format!("failed to compress logs: {err}"),
+                }),
+            )
+        }
+    };
 
     let mut tx = state.pool.begin().await.unwrap();
 
@@ -212,17 +238,49 @@ async fn handler_submit_batch(
         );
     }
 
+    // Deduplicate by hash per agent to drop resends.
+    let duplicate = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM batches WHERE agent_id = ?1 AND hash = ?2 LIMIT 1",
+    )
+    .bind(&batch.agent_id)
+    .bind(computed_hash.to_vec())
+    .fetch_optional(&mut tx)
+    .await;
+
+    match duplicate {
+        Ok(Some(_)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(SubmitResponse {
+                    status: "error".into(),
+                    message: "duplicate batch content for agent".into(),
+                }),
+            );
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(SubmitResponse {
+                    status: "error".into(),
+                    message: "failed to check duplicates".into(),
+                }),
+            );
+        }
+        _ => {}
+    }
+
     let insert_res = sqlx::query(
         r#"
-        INSERT INTO batches (agent_id, seq, prev_hash, hash, logs, timestamp, signature, public_key, received_at, source)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        INSERT INTO batches (agent_id, seq, prev_hash, hash, logs, logs_compressed, timestamp, signature, public_key, received_at, source)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
         "#,
     )
     .bind(&batch.agent_id)
     .bind(batch.seq as i64)
     .bind(batch.prev_hash.to_vec())
     .bind(computed_hash.to_vec())
-    .bind(logs_json)
+    .bind("") // keep legacy column minimal; logs_compressed holds the data
+    .bind(logs_compressed)
     .bind(batch.timestamp as i64)
     .bind(batch.signature.to_bytes().to_vec())
     .bind(batch.public_key.to_bytes().to_vec())
@@ -238,7 +296,7 @@ async fn handler_submit_batch(
                     StatusCode::CONFLICT,
                     Json(SubmitResponse {
                         status: "error".into(),
-                        message: "duplicate batch for agent/seq".into(),
+                        message: "duplicate batch for agent".into(),
                     }),
                 );
             }
@@ -539,7 +597,12 @@ fn row_to_query_batch(row: sqlx::sqlite::SqliteRow) -> Result<QueryBatch, Status
     let seq: i64 = row.get("seq");
     let prev_hash: Vec<u8> = row.get("prev_hash");
     let hash_vec: Vec<u8> = row.get("hash");
-    let logs_json: String = row.get("logs");
+    let compressed: Option<Vec<u8>> = row.try_get("logs_compressed").ok();
+    let logs_json: String = if let Some(blob) = compressed {
+        decompress_json(&blob).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    } else {
+        row.get("logs")
+    };
     let timestamp: i64 = row.get("timestamp");
     let signature_vec: Vec<u8> = row.get("signature");
     let public_key_vec: Vec<u8> = row.get("public_key");
@@ -703,6 +766,23 @@ fn hex_val(b: u8) -> Result<u8, String> {
         b'A'..=b'F' => Ok(10 + (b - b'A')),
         _ => Err("invalid hex".into()),
     }
+}
+
+fn compress_json(data: &str) -> Result<Vec<u8>, String> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(data.as_bytes())
+        .map_err(|e| e.to_string())?;
+    encoder.finish().map_err(|e| e.to_string())
+}
+
+fn decompress_json(bytes: &[u8]) -> Result<String, String> {
+    let mut decoder = GzDecoder::new(bytes);
+    let mut out = String::new();
+    decoder
+        .read_to_string(&mut out)
+        .map_err(|e| e.to_string())?;
+    Ok(out)
 }
 
 async fn configure_sqlite(pool: &SqlitePool) {
