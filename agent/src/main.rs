@@ -1,6 +1,7 @@
-use common::batch::{LogBatch, generate_keypair};
+use common::batch::{generate_keypair, LogBatch};
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::time::{sleep, Duration};
 use chrono::Utc;
 use ed25519_dalek::Signature;
 use anyhow::Result;
@@ -17,6 +18,10 @@ async fn main() -> Result<()> {
     println!("Agent ID: {}", config.agent_id);
     println!("Tailing {}", config.log_path.display());
     println!("Sending to {}", config.server_url);
+    println!(
+        "Retries: max {} with base {}ms",
+        config.max_retries, config.retry_base_ms
+    );
 
     let mut key = load_or_generate_key(&config)?;
     let mut seq = load_seq(&config)?; // persistent monotonic counter
@@ -55,7 +60,7 @@ async fn main() -> Result<()> {
             println!("Produced batch: {:?}", prev_hash);
 
             // Send to server; on success advance chain/seq
-            match send_batch(&config.server_url, &batch).await {
+            match send_batch(&config, &batch).await {
                 Ok(_) => {
                     prev_hash = next_hash;
                     seq += 1;
@@ -78,22 +83,45 @@ async fn main() -> Result<()> {
 /* -------------------------
    POST BATCH TO SERVER
 ------------------------- */
-async fn send_batch(server_url: &str, batch: &LogBatch) -> Result<()> {
+async fn send_batch(config: &AgentConfig, batch: &LogBatch) -> Result<()> {
     let client = reqwest::Client::new();
+    let mut attempt: u32 = 0;
 
-    let resp = client
-        .post(format!("{}/submit", server_url))
-        .json(batch)
-        .send()
-        .await?;
+    loop {
+        attempt += 1;
+        let resp = client
+            .post(format!("{}/submit", config.server_url))
+            .json(batch)
+            .send()
+            .await;
 
-    if resp.status().is_success() {
-        println!("Batch sent successfully");
-    } else {
-        println!("Server rejected batch: {}", resp.status());
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                println!("Batch sent successfully (attempt {})", attempt);
+                return Ok(());
+            }
+            Ok(r) => {
+                eprintln!(
+                    "Server rejected batch (attempt {}): status {}",
+                    attempt,
+                    r.status()
+                );
+            }
+            Err(err) => {
+                eprintln!("Network error sending batch (attempt {}): {err}", attempt);
+            }
+        }
+
+        if attempt >= config.max_retries {
+            return Err(anyhow::anyhow!(
+                "exhausted retries after {} attempts",
+                attempt
+            ));
+        }
+
+        let backoff_ms = config.retry_base_ms.saturating_mul(1 << (attempt - 1));
+        sleep(Duration::from_millis(backoff_ms)).await;
     }
-
-    Ok(())
 }
 
 struct AgentConfig {
@@ -101,12 +129,16 @@ struct AgentConfig {
     server_url: String,
     state_dir: PathBuf,
     agent_id: String,
+    max_retries: u32,
+    retry_base_ms: u64,
 }
 
 struct AgentArgs {
     log_path: Option<PathBuf>,
     server_url: Option<String>,
     state_dir: Option<PathBuf>,
+    max_retries: Option<u32>,
+    retry_base_ms: Option<u64>,
 }
 
 impl AgentArgs {
@@ -114,6 +146,8 @@ impl AgentArgs {
         let mut log_path = None;
         let mut server_url = None;
         let mut state_dir = None;
+        let mut max_retries = None;
+        let mut retry_base_ms = None;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -133,6 +167,16 @@ impl AgentArgs {
                         state_dir = Some(PathBuf::from(v));
                     }
                 }
+                "--max-retries" => {
+                    if let Some(v) = args.next() {
+                        max_retries = v.parse().ok();
+                    }
+                }
+                "--retry-base-ms" => {
+                    if let Some(v) = args.next() {
+                        retry_base_ms = v.parse().ok();
+                    }
+                }
                 _ => {}
             }
         }
@@ -141,6 +185,8 @@ impl AgentArgs {
             log_path,
             server_url,
             state_dir,
+            max_retries,
+            retry_base_ms,
         }
     }
 }
@@ -166,6 +212,16 @@ impl AgentConfig {
             .or_else(|| env::var("AGENT_SERVER_URL").ok())
             .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
 
+        let max_retries = args
+            .max_retries
+            .or_else(|| env::var("AGENT_MAX_RETRIES").ok().and_then(|v| v.parse().ok()))
+            .unwrap_or(5);
+
+        let retry_base_ms = args
+            .retry_base_ms
+            .or_else(|| env::var("AGENT_RETRY_BASE_MS").ok().and_then(|v| v.parse().ok()))
+            .unwrap_or(500);
+
         let key_path = Self::key_path(&state_dir);
         let agent_id = derive_agent_id(&key_path)?;
 
@@ -174,6 +230,8 @@ impl AgentConfig {
             server_url,
             state_dir,
             agent_id,
+            max_retries,
+            retry_base_ms,
         })
     }
 

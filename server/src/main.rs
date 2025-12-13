@@ -60,6 +60,10 @@ struct AgentCheckpoint {
     count: u64,
 }
 
+fn log_submit_error(agent: &str, reason: &str) {
+    eprintln!("submit rejected for agent {}: {}", agent, reason);
+}
+
 #[derive(Debug, Deserialize)]
 struct RegisterRequest {
     agent_id: String,
@@ -229,6 +233,7 @@ async fn handler_submit_batch(
     Json(batch): Json<LogBatch>,
 ) -> impl IntoResponse {
     if !batch.verify() {
+        log_submit_error(&batch.agent_id, "invalid signature");
         return (
             StatusCode::BAD_REQUEST,
             Json(SubmitResponse {
@@ -257,6 +262,7 @@ async fn handler_submit_batch(
 
     // Ensure agent key is trusted/registered before accepting.
     if let Err(msg) = ensure_agent_key(&state, &mut tx, &batch).await {
+        log_submit_error(&batch.agent_id, &msg);
         return (
             StatusCode::BAD_REQUEST,
             Json(SubmitResponse {
@@ -268,6 +274,7 @@ async fn handler_submit_batch(
 
     // Validate hash chain + ordering for this agent.
     if let Err(msg) = validate_chain(&mut tx, &batch, &computed_hash).await {
+        log_submit_error(&batch.agent_id, &msg);
         return (
             StatusCode::BAD_REQUEST,
             Json(SubmitResponse {
@@ -289,6 +296,7 @@ async fn handler_submit_batch(
     let duplicate = match duplicate {
         Ok(v) => v,
         Err(_) => {
+            log_submit_error(&batch.agent_id, "duplicate check failed");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(SubmitResponse {
@@ -300,6 +308,7 @@ async fn handler_submit_batch(
     };
 
     if duplicate.is_some() {
+        log_submit_error(&batch.agent_id, "duplicate batch content for agent");
         return (
             StatusCode::CONFLICT,
             Json(SubmitResponse {
