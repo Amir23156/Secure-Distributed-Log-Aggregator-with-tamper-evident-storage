@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
+use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{self, Duration};
 
@@ -84,7 +85,8 @@ async fn main() {
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let pool = SqlitePool::connect("sqlite://logchain.db")
+    let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://logchain.db".to_string());
+    let pool = SqlitePool::connect(&db_url)
         .await
         .unwrap();
 
@@ -207,7 +209,10 @@ async fn main() {
         .route("/batches/:id", get(handler_get_one))
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let bind_addr = env::var("SERVER_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let addr: SocketAddr = bind_addr
+        .parse()
+        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 3000)));
     println!("Server listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();

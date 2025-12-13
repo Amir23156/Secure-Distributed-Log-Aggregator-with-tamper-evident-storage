@@ -4,6 +4,26 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 
+#[derive(Default)]
+struct CliArgs {
+    server_url: Option<String>,
+}
+
+impl CliArgs {
+    fn parse() -> Self {
+        let mut server_url = None;
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            if arg == "--server-url" {
+                if let Some(v) = args.next() {
+                    server_url = Some(v);
+                }
+            }
+        }
+        Self { server_url }
+    }
+}
+
 #[derive(Deserialize)]
 struct RemoteBatch {
     id: i64,
@@ -13,8 +33,11 @@ struct RemoteBatch {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let server_url = env::var("CLI_SERVER_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+    let args = CliArgs::parse();
+    let server_url = args
+        .server_url
+        .or_else(|| env::var("CLI_SERVER_URL").ok())
+        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
 
     println!("Fetching batches from server {}...", server_url);
 

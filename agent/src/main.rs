@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 async fn main() -> Result<()> {
     println!("Starting agent...");
 
-    let config = AgentConfig::load()?;
+    let cli_args = AgentArgs::parse();
+    let config = AgentConfig::load(cli_args)?;
     println!("Agent ID: {}", config.agent_id);
     println!("Tailing {}", config.log_path.display());
     println!("Sending to {}", config.server_url);
@@ -102,22 +103,68 @@ struct AgentConfig {
     agent_id: String,
 }
 
+struct AgentArgs {
+    log_path: Option<PathBuf>,
+    server_url: Option<String>,
+    state_dir: Option<PathBuf>,
+}
+
+impl AgentArgs {
+    fn parse() -> Self {
+        let mut log_path = None;
+        let mut server_url = None;
+        let mut state_dir = None;
+
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--log-path" => {
+                    if let Some(v) = args.next() {
+                        log_path = Some(PathBuf::from(v));
+                    }
+                }
+                "--server-url" => {
+                    if let Some(v) = args.next() {
+                        server_url = Some(v);
+                    }
+                }
+                "--state-dir" => {
+                    if let Some(v) = args.next() {
+                        state_dir = Some(PathBuf::from(v));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Self {
+            log_path,
+            server_url,
+            state_dir,
+        }
+    }
+}
+
 impl AgentConfig {
-    fn load() -> Result<Self> {
+    fn load(args: AgentArgs) -> Result<Self> {
         let home = env::var("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."));
-        let state_dir = env::var("AGENT_STATE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home.join(".logagent"));
+        let state_dir = args
+            .state_dir
+            .or_else(|| env::var("AGENT_STATE_DIR").ok().map(PathBuf::from))
+            .unwrap_or_else(|| home.join(".logagent"));
         fs::create_dir_all(&state_dir)?;
 
-        let log_path = env::var("AGENT_LOG_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/var/log/dpkg.log"));
+        let log_path = args
+            .log_path
+            .or_else(|| env::var("AGENT_LOG_PATH").ok().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("/var/log/dpkg.log"));
 
-        let server_url = env::var("AGENT_SERVER_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:3000".to_string());
+        let server_url = args
+            .server_url
+            .or_else(|| env::var("AGENT_SERVER_URL").ok())
+            .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
 
         let key_path = Self::key_path(&state_dir);
         let agent_id = derive_agent_id(&key_path)?;
