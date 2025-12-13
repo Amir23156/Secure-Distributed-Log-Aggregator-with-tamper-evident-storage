@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -8,7 +8,7 @@ use axum::{
 use common::batch::LogBatch;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -78,7 +78,9 @@ async fn main() {
             logs TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
             signature BLOB NOT NULL,
-            public_key BLOB NOT NULL
+            public_key BLOB NOT NULL,
+            received_at INTEGER NOT NULL DEFAULT 0,
+            source TEXT
         );
         "#,
     )
@@ -98,6 +100,9 @@ async fn main() {
     .execute(&pool)
     .await
     .unwrap();
+
+    ensure_column(&pool, "batches", "received_at", "INTEGER NOT NULL DEFAULT 0").await;
+    ensure_column(&pool, "batches", "source", "TEXT").await;
 
     sqlx::query(
         r#"
@@ -125,7 +130,8 @@ async fn main() {
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("Server listening on {}", addr);
 
-    axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app)
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .unwrap();
 }
@@ -134,6 +140,7 @@ async fn main() {
 
 async fn handler_submit_batch(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(batch): Json<LogBatch>,
 ) -> impl IntoResponse {
     if !batch.verify() {
@@ -149,8 +156,10 @@ async fn handler_submit_batch(
     let computed_hash = batch.compute_hash();
     let logs_json = serde_json::to_string(&batch.logs).unwrap();
 
+    let mut tx = state.pool.begin().await.unwrap();
+
     // Ensure agent key is trusted/registered before accepting.
-    if let Err(msg) = ensure_agent_key(&state, &batch).await {
+    if let Err(msg) = ensure_agent_key(&state, &mut tx, &batch).await {
         return (
             StatusCode::BAD_REQUEST,
             Json(SubmitResponse {
@@ -161,7 +170,7 @@ async fn handler_submit_batch(
     }
 
     // Validate hash chain + ordering for this agent.
-    if let Err(msg) = validate_chain(&state.pool, &batch, &computed_hash).await {
+    if let Err(msg) = validate_chain(&mut tx, &batch, &computed_hash).await {
         return (
             StatusCode::BAD_REQUEST,
             Json(SubmitResponse {
@@ -171,10 +180,10 @@ async fn handler_submit_batch(
         );
     }
 
-    sqlx::query(
+    let insert_res = sqlx::query(
         r#"
-        INSERT INTO batches (agent_id, seq, prev_hash, hash, logs, timestamp, signature, public_key)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        INSERT INTO batches (agent_id, seq, prev_hash, hash, logs, timestamp, signature, public_key, received_at, source)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
         "#,
     )
     .bind(&batch.agent_id)
@@ -185,9 +194,33 @@ async fn handler_submit_batch(
     .bind(batch.timestamp as i64)
     .bind(batch.signature.to_bytes().to_vec())
     .bind(batch.public_key.to_bytes().to_vec())
-    .execute(&state.pool)
-    .await
-    .unwrap();
+    .bind(now_unix())
+    .bind(addr.to_string())
+    .execute(&mut tx)
+    .await;
+
+    if let Err(e) = insert_res {
+        if let sqlx::Error::Database(db) = &e {
+            if db.is_unique_violation() {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(SubmitResponse {
+                        status: "error".into(),
+                        message: "duplicate batch for agent/seq".into(),
+                    }),
+                );
+            }
+        }
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(SubmitResponse {
+                status: "error".into(),
+                message: format!("failed to store batch: {}", e),
+            }),
+        );
+    }
+
+    tx.commit().await.unwrap();
 
     (
         StatusCode::CREATED,
@@ -484,14 +517,18 @@ fn row_to_query_batch(row: sqlx::sqlite::SqliteRow) -> Result<QueryBatch, Status
     Ok(QueryBatch { id, batch, hash })
 }
 
-async fn validate_chain(pool: &SqlitePool, batch: &LogBatch, computed_hash: &[u8; 32]) -> Result<(), String> {
+async fn validate_chain(
+    tx: &mut Transaction<'_, Sqlite>,
+    batch: &LogBatch,
+    computed_hash: &[u8; 32],
+) -> Result<(), String> {
     use std::convert::TryInto;
 
     let last_row = sqlx::query(
         "SELECT seq, hash FROM batches WHERE agent_id = ?1 ORDER BY seq DESC LIMIT 1",
     )
     .bind(&batch.agent_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|_| "failed to check chain state".to_string())?;
 
@@ -532,10 +569,14 @@ async fn validate_chain(pool: &SqlitePool, batch: &LogBatch, computed_hash: &[u8
     Ok(())
 }
 
-async fn ensure_agent_key(state: &AppState, batch: &LogBatch) -> Result<(), String> {
+async fn ensure_agent_key(
+    state: &AppState,
+    tx: &mut Transaction<'_, Sqlite>,
+    batch: &LogBatch,
+) -> Result<(), String> {
     let existing = sqlx::query("SELECT public_key FROM agents WHERE agent_id = ?1")
         .bind(&batch.agent_id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|_| "failed to check agent registry".to_string())?;
 
@@ -555,7 +596,7 @@ async fn ensure_agent_key(state: &AppState, batch: &LogBatch) -> Result<(), Stri
                 .bind(&batch.agent_id)
                 .bind(batch.public_key.to_bytes().to_vec())
                 .bind(now_unix())
-                .execute(&state.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|_| "failed to auto-register agent key".to_string())?;
         }
@@ -595,6 +636,27 @@ fn hex_val(b: u8) -> Result<u8, String> {
         b'A'..=b'F' => Ok(10 + (b - b'A')),
         _ => Err("invalid hex".into()),
     }
+}
+
+async fn ensure_column(pool: &SqlitePool, table: &str, column: &str, definition: &str) {
+    let sql = format!(
+        "SELECT 1 FROM pragma_table_info('{table}') WHERE name = ?1"
+    );
+    let exists: Option<(i64,)> = sqlx::query_as(&sql)
+        .bind(column)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+    if exists.is_some() {
+        return;
+    }
+
+    let alter = format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+    );
+    let _ = sqlx::query(&alter).execute(pool).await;
 }
 
 fn now_unix() -> i64 {
