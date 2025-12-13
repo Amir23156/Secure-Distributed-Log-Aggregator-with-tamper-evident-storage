@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::time::{self, Duration};
 
 #[derive(Clone)]
 struct AppState {
@@ -35,6 +36,12 @@ struct QueryBatch {
 struct ListParams {
     agent_id: Option<String>,
     since_seq: Option<u64>,
+    limit: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExportParams {
+    since_id: Option<i64>,
     limit: Option<u64>,
 }
 
@@ -66,6 +73,8 @@ async fn main() {
     let pool = SqlitePool::connect("sqlite://logchain.db")
         .await
         .unwrap();
+
+    configure_sqlite(&pool).await;
 
     sqlx::query(
         r#"
@@ -115,6 +124,27 @@ async fn main() {
     .await
     .unwrap();
 
+    if let Ok(backup_path) = std::env::var("SQLITE_BACKUP_PATH") {
+        let interval_secs = std::env::var("SQLITE_BACKUP_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(300);
+        let pool_clone = pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = time::interval(Duration::from_secs(interval_secs));
+            loop {
+                ticker.tick().await;
+                if let Err(err) = snapshot_database(&pool_clone, &backup_path).await {
+                    eprintln!("Failed to snapshot database: {err}");
+                }
+            }
+        });
+        println!(
+            "Periodic SQLite snapshots enabled every {}s to {}",
+            interval_secs, backup_path
+        );
+    }
+
     let state = AppState {
         pool,
         require_registration,
@@ -125,6 +155,7 @@ async fn main() {
         .route("/agents/register", post(handler_register_agent))
         .route("/agents/rotate", post(handler_rotate_agent))
         .route("/batches", get(handler_get_all))
+        .route("/batches/export", get(handler_export))
         .route("/batches/:id", get(handler_get_one))
         .with_state(state);
 
@@ -443,6 +474,41 @@ async fn handler_get_all(
     Ok(Json(results))
 }
 
+/* ----------------------- EXPORT /batches/export ----------------------- */
+
+async fn handler_export(
+    State(state): State<AppState>,
+    Query(params): Query<ExportParams>,
+) -> Result<Json<Vec<QueryBatch>>, StatusCode> {
+    let mut builder = QueryBuilder::new("SELECT * FROM batches");
+
+    if let Some(since_id) = params.since_id {
+        builder.push(" WHERE id > ");
+        builder.push_bind(since_id);
+    }
+
+    builder.push(" ORDER BY id ASC");
+
+    if let Some(limit) = params.limit {
+        builder.push(" LIMIT ");
+        builder.push_bind(limit as i64);
+    }
+
+    let rows = builder
+        .build()
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let mut results = Vec::new();
+
+    for row in rows {
+        results.push(row_to_query_batch(row)?);
+    }
+
+    Ok(Json(results))
+}
+
 /* ----------------------- GET /batches/:id ----------------------- */
 
 async fn handler_get_one(
@@ -637,6 +703,22 @@ fn hex_val(b: u8) -> Result<u8, String> {
         b'A'..=b'F' => Ok(10 + (b - b'A')),
         _ => Err("invalid hex".into()),
     }
+}
+
+async fn configure_sqlite(pool: &SqlitePool) {
+    // WAL improves durability and allows concurrent readers.
+    let _ = sqlx::query("PRAGMA journal_mode=WAL").execute(pool).await;
+    let _ = sqlx::query("PRAGMA synchronous=FULL").execute(pool).await;
+}
+
+async fn snapshot_database(pool: &SqlitePool, path: &str) -> Result<(), String> {
+    let escaped = path.replace('\'', "''");
+    let vacuum_sql = format!("VACUUM INTO '{escaped}'");
+    sqlx::query(&vacuum_sql)
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 async fn ensure_column(pool: &SqlitePool, table: &str, column: &str, definition: &str) {
