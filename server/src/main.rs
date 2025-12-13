@@ -39,6 +39,10 @@ struct ListParams {
     agent_id: Option<String>,
     since_seq: Option<u64>,
     limit: Option<u64>,
+    offset: Option<u64>,
+    since_timestamp: Option<u64>,
+    until_timestamp: Option<u64>,
+    log_substring: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,17 +142,38 @@ async fn main() {
     .await
     .unwrap();
 
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_batches_agent_ts
+        ON batches (agent_id, timestamp);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_batches_ts
+        ON batches (timestamp);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
     if let Ok(backup_path) = std::env::var("SQLITE_BACKUP_PATH") {
         let interval_secs = std::env::var("SQLITE_BACKUP_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(300);
         let pool_clone = pool.clone();
+        let backup_path_task = backup_path.clone();
         tokio::spawn(async move {
             let mut ticker = time::interval(Duration::from_secs(interval_secs));
             loop {
                 ticker.tick().await;
-                if let Err(err) = snapshot_database(&pool_clone, &backup_path).await {
+                if let Err(err) = snapshot_database(&pool_clone, &backup_path_task).await {
                     eprintln!("Failed to snapshot database: {err}");
                 }
             }
@@ -244,19 +269,11 @@ async fn handler_submit_batch(
     )
     .bind(&batch.agent_id)
     .bind(computed_hash.to_vec())
-    .fetch_optional(&mut tx)
+    .fetch_optional(tx.as_mut())
     .await;
 
-    match duplicate {
-        Ok(Some(_)) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(SubmitResponse {
-                    status: "error".into(),
-                    message: "duplicate batch content for agent".into(),
-                }),
-            );
-        }
+    let duplicate = match duplicate {
+        Ok(v) => v,
         Err(_) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -266,7 +283,16 @@ async fn handler_submit_batch(
                 }),
             );
         }
-        _ => {}
+    };
+
+    if duplicate.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(SubmitResponse {
+                status: "error".into(),
+                message: "duplicate batch content for agent".into(),
+            }),
+        );
     }
 
     let insert_res = sqlx::query(
@@ -279,14 +305,14 @@ async fn handler_submit_batch(
     .bind(batch.seq as i64)
     .bind(batch.prev_hash.to_vec())
     .bind(computed_hash.to_vec())
-    .bind("") // keep legacy column minimal; logs_compressed holds the data
+    .bind(logs_json) // keep plaintext for search/filter, compressed for space
     .bind(logs_compressed)
     .bind(batch.timestamp as i64)
     .bind(batch.signature.to_bytes().to_vec())
     .bind(batch.public_key.to_bytes().to_vec())
     .bind(now_unix())
     .bind(addr.to_string())
-    .execute(&mut tx)
+    .execute(tx.as_mut())
     .await;
 
     if let Err(e) = insert_res {
@@ -492,22 +518,59 @@ async fn handler_get_all(
     Query(params): Query<ListParams>,
 ) -> Result<Json<Vec<QueryBatch>>, StatusCode> {
     let mut builder = QueryBuilder::new("SELECT * FROM batches");
-
     let mut first_clause = true;
-    if params.agent_id.is_some() || params.since_seq.is_some() {
+
+    if params.agent_id.is_some()
+        || params.since_seq.is_some()
+        || params.since_timestamp.is_some()
+        || params.until_timestamp.is_some()
+        || params.log_substring.is_some()
+    {
         builder.push(" WHERE ");
-        if let Some(agent) = &params.agent_id {
-            builder.push("agent_id = ");
-            builder.push_bind(agent);
-            first_clause = false;
+    }
+
+    if let Some(agent) = &params.agent_id {
+        if !first_clause {
+            builder.push(" AND ");
         }
-        if let Some(seq) = params.since_seq {
-            if !first_clause {
-                builder.push(" AND ");
-            }
-            builder.push("seq >= ");
-            builder.push_bind(seq as i64);
+        builder.push("agent_id = ");
+        builder.push_bind(agent);
+        first_clause = false;
+    }
+
+    if let Some(seq) = params.since_seq {
+        if !first_clause {
+            builder.push(" AND ");
         }
+        builder.push("seq >= ");
+        builder.push_bind(seq as i64);
+        first_clause = false;
+    }
+
+    if let Some(ts) = params.since_timestamp {
+        if !first_clause {
+            builder.push(" AND ");
+        }
+        builder.push("timestamp >= ");
+        builder.push_bind(ts as i64);
+        first_clause = false;
+    }
+
+    if let Some(ts) = params.until_timestamp {
+        if !first_clause {
+            builder.push(" AND ");
+        }
+        builder.push("timestamp <= ");
+        builder.push_bind(ts as i64);
+        first_clause = false;
+    }
+
+    if let Some(sub) = &params.log_substring {
+        if !first_clause {
+            builder.push(" AND ");
+        }
+        builder.push("logs LIKE ");
+        builder.push_bind(format!("%{}%", sub));
     }
 
     builder.push(" ORDER BY agent_id ASC, seq ASC");
@@ -515,6 +578,10 @@ async fn handler_get_all(
     if let Some(limit) = params.limit {
         builder.push(" LIMIT ");
         builder.push_bind(limit as i64);
+    }
+    if let Some(offset) = params.offset {
+        builder.push(" OFFSET ");
+        builder.push_bind(offset as i64);
     }
 
     let rows = builder
@@ -658,7 +725,7 @@ async fn validate_chain(
         "SELECT seq, hash FROM batches WHERE agent_id = ?1 ORDER BY seq DESC LIMIT 1",
     )
     .bind(&batch.agent_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx.as_mut())
     .await
     .map_err(|_| "failed to check chain state".to_string())?;
 
@@ -706,7 +773,7 @@ async fn ensure_agent_key(
 ) -> Result<(), String> {
     let existing = sqlx::query("SELECT public_key FROM agents WHERE agent_id = ?1")
         .bind(&batch.agent_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.as_mut())
         .await
         .map_err(|_| "failed to check agent registry".to_string())?;
 
@@ -726,7 +793,7 @@ async fn ensure_agent_key(
                 .bind(&batch.agent_id)
                 .bind(batch.public_key.to_bytes().to_vec())
                 .bind(now_unix())
-                .execute(&mut *tx)
+                .execute(tx.as_mut())
                 .await
                 .map_err(|_| "failed to auto-register agent key".to_string())?;
         }
