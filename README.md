@@ -2,6 +2,9 @@
 
 Tamper-evident log shipping with an **agent** that tails local logs, a **server** that verifies and stores signed batches, and a **CLI** that audits the stored chain per agent.
 
+<img width="1062" height="390" alt="Blank diagram" src="https://github.com/user-attachments/assets/8a928c4b-e09b-452d-8593-a9adc0ad4ce6" />
+
+
 ## Project layout
 - `common/` – shared batch format, hashing, signing helpers.
 - `server/` – Axum + SQLite API for ingesting, querying, and exporting batches; enforces append-only and per-agent sequencing.
